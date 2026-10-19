@@ -1,763 +1,267 @@
-import 'dart:convert';
-import 'package:flutter/material.dart';
-import 'package:flutter/services.dart';
-import 'package:shared_preferences/shared_preferences.dart';
+# -*- coding: utf-8 -*-
+import os, json, threading
+from datetime import datetime
+from kivy.app import App
+from kivy.clock import Clock
+from kivy.core.clipboard import Clipboard
+from kivy.metrics import dp
+from kivy.utils import get_color_from_hex
+from kivy.graphics import Color, RoundedRectangle
+from kivy.uix.boxlayout import BoxLayout
+from kivy.uix.button import Button
+from kivy.uix.label import Label
+from kivy.uix.textinput import TextInput
+from kivy.uix.scrollview import ScrollView
+from kivy.uix.popup import Popup
 
-void main() async {
-  WidgetsFlutterBinding.ensureInitialized();
-  runApp(const TaskMasterApp());
-}
+try:
+    from google import genai
+    from google.genai import types
+except ImportError:
+    genai = None
+    types = None
 
-class AppTheme {
-  static const Color background = Color(0xFF0D1117);
-  static const Color surface = Color(0xFF161B22);
-  static const Color surfaceAlt = Color(0xFF21262D);
-  static const Color border = Color(0xFF30363D);
-  static const Color primary = Color(0xFF1F6FEB);
-  static const Color primaryLight = Color(0xFF58A6FF);
-  static const Color success = Color(0xFF2EA043);
-  static const Color danger = Color(0xFFCF222E);
-  static const Color warning = Color(0xFFD29922);
-  static const Color textPrimary = Color(0xFFE6EDF3);
-  static const Color textMuted = Color(0xFF8B949E);
+BG = get_color_from_hex("#0D0B14")
+PANEL = get_color_from_hex("#191522")
+PURPLE = get_color_from_hex("#9B7BFF")
+TEXT = get_color_from_hex("#F6F2FF")
+MUTED = get_color_from_hex("#B6ADC9")
+USER_BG = get_color_from_hex("#302542")
+MODEL = "gemini-2.5-flash"
+SYSTEM_PROMPT = (
+    "You are SHADOW AI, a helpful and accurate AI and coding assistant. "
+    "Explain code clearly, put code in fenced code blocks, and never invent facts."
+)
 
-  static ThemeData get dark => ThemeData(
-        useMaterial3: true,
-        brightness: Brightness.dark,
-        scaffoldBackgroundColor: background,
-        colorScheme: const ColorScheme.dark(
-          primary: primary,
-          secondary: primaryLight,
-          surface: surface,
-          error: danger,
-          onPrimary: Colors.white,
-          onSurface: textPrimary,
-        ),
-        appBarTheme: const AppBarTheme(
-          backgroundColor: background,
-          elevation: 0,
-          centerTitle: true,
-          titleTextStyle: TextStyle(
-            color: textPrimary,
-            fontSize: 20,
-            fontWeight: FontWeight.bold,
-          ),
-        ),
-        floatingActionButtonTheme: const FloatingActionButtonThemeData(
-          backgroundColor: primary,
-          foregroundColor: Colors.white,
-        ),
-        inputDecorationTheme: InputDecorationTheme(
-          filled: true,
-          fillColor: surfaceAlt,
-          contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
-          border: OutlineInputBorder(
-            borderRadius: BorderRadius.circular(14),
-            borderSide: const BorderSide(color: border),
-          ),
-          enabledBorder: OutlineInputBorder(
-            borderRadius: BorderRadius.circular(14),
-            borderSide: const BorderSide(color: border),
-          ),
-          focusedBorder: OutlineInputBorder(
-            borderRadius: BorderRadius.circular(14),
-            borderSide: const BorderSide(color: primaryLight, width: 1.5),
-          ),
-        ),
-      );
-}
+def load_json(path, fallback):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError, TypeError):
+        return fallback
 
-class Task {
-  final String id;
-  String title;
-  bool done;
-  final DateTime createdAt;
+def save_json(path, value):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    temp_path = path + ".tmp"
+    with open(temp_path, "w", encoding="utf-8") as f:
+        json.dump(value, f, ensure_ascii=False, indent=2)
+    os.replace(temp_path, path)
 
-  Task({
-    required this.id,
-    required this.title,
-    this.done = false,
-    required this.createdAt,
-  });
+class ShadowAI(App):
+    title = "SHADOW AI"
 
-  Map<String, dynamic> toJson() => {
-        'id': id,
-        'title': title,
-        'done': done,
-        'createdAt': createdAt.toIso8601String(),
-      };
+    def build(self):
+        self.config_path = os.path.join(self.user_data_dir, "config.json")
+        self.history_path = os.path.join(self.user_data_dir, "history.json")
+        self.settings = load_json(self.config_path, {})
+        self.history = load_json(self.history_path, [])
+        self.client = None
+        self.busy = False
 
-  factory Task.fromJson(Map<String, dynamic> json) => Task(
-        id: json['id'] as String,
-        title: json['title'] as String,
-        done: json['done'] as bool? ?? false,
-        createdAt: DateTime.parse(json['createdAt'] as String),
-      );
-}
+        root = BoxLayout(orientation="vertical", padding=dp(10), spacing=dp(8))
+        with root.canvas.before:
+            Color(*BG)
+            self.bg_rect = RoundedRectangle(pos=root.pos, size=root.size)
+        root.bind(pos=self.update_bg, size=self.update_bg)
 
-class TaskMasterApp extends StatelessWidget {
-  const TaskMasterApp({super.key});
+        header = BoxLayout(size_hint_y=None, height=dp(56), spacing=dp(8))
+        brand = Label(text="[b]SHADOW AI[/b]\\n[size=12]Your AI coding assistant[/size]",
+                      markup=True, color=TEXT, halign="left", valign="middle")
+        brand.bind(size=lambda widget, size: setattr(widget, "text_size", size))
+        header.add_widget(brand)
+        settings_button = Button(text="Settings", size_hint_x=None, width=dp(94),
+                                 background_normal="", background_color=PURPLE, color=BG)
+        settings_button.bind(on_release=lambda *_: self.show_settings())
+        header.add_widget(settings_button)
+        root.add_widget(header)
 
-  @override
-  Widget build(BuildContext context) {
-    return MaterialApp(
-      title: 'Nyrvox Ai_1',
-      debugShowCheckedModeBanner: false,
-      theme: AppTheme.dark,
-      home: const TaskHomePage(),
-    );
-  }
-}
+        toolbar = BoxLayout(size_hint_y=None, height=dp(42), spacing=dp(6))
+        new_button = Button(text="New chat", background_normal="", background_color=PANEL, color=TEXT)
+        new_button.bind(on_release=lambda *_: self.new_chat())
+        copy_button = Button(text="Copy last reply", background_normal="", background_color=PANEL, color=TEXT)
+        copy_button.bind(on_release=lambda *_: self.copy_last())
+        toolbar.add_widget(new_button)
+        toolbar.add_widget(copy_button)
+        root.add_widget(toolbar)
 
-enum TaskFilter { all, active, completed }
+        self.scroll = ScrollView(do_scroll_x=False)
+        self.chat = BoxLayout(orientation="vertical", size_hint_y=None, spacing=dp(8), padding=dp(5))
+        self.chat.bind(minimum_height=self.chat.setter("height"))
+        self.scroll.add_widget(self.chat)
+        root.add_widget(self.scroll, 1)
 
-class TaskHomePage extends StatefulWidget {
-  const TaskHomePage({super.key});
+        self.status = Label(text="Ready. Add your Gemini API key in Settings.",
+                            color=MUTED, size_hint_y=None, height=dp(28), font_size="12sp")
+        root.add_widget(self.status)
 
-  @override
-  State<TaskHomePage> createState() => _TaskHomePageState();
-}
+        composer = BoxLayout(size_hint_y=None, height=dp(96), spacing=dp(6))
+        self.message_input = TextInput(
+            hint_text="Type your message...", multiline=True,
+            background_color=PANEL, foreground_color=TEXT,
+            hint_text_color=MUTED, cursor_color=PURPLE, padding=dp(10)
+        )
+        composer.add_widget(self.message_input)
+        self.send_button = Button(text="Send", size_hint_x=None, width=dp(78),
+                                  background_normal="", background_color=PURPLE, color=BG)
+        self.send_button.bind(on_release=lambda *_: self.send_message())
+        composer.add_widget(self.send_button)
+        root.add_widget(composer)
 
-class _TaskHomePageState extends State<TaskHomePage>
-    with SingleTickerProviderStateMixin {
-  static const String _storageKey = 'klencod_tasks_v1';
+        self.render_history()
+        if not self.settings.get("api_key"):
+            Clock.schedule_once(lambda *_: self.show_settings(), 0.6)
+        return root
 
-  final List<Task> _tasks = [];
-  final TextEditingController _searchController = TextEditingController();
-  TaskFilter _filter = TaskFilter.all;
-  String _searchQuery = '';
-  bool _loading = true;
-  late AnimationController _fadeController;
+    def update_bg(self, widget, *_):
+        self.bg_rect.pos = widget.pos
+        self.bg_rect.size = widget.size
 
-  @override
-  void initState() {
-    super.initState();
-    _fadeController = AnimationController(
-      vsync: this,
-      duration: const Duration(milliseconds: 300),
-    );
-    _loadTasks();
-  }
+    def show_settings(self):
+        panel = BoxLayout(orientation="vertical", padding=dp(12), spacing=dp(9))
+        panel.add_widget(Label(text="Gemini API key (stored locally on this device)",
+                               color=TEXT, size_hint_y=None, height=dp(42)))
+        key_input = TextInput(text=self.settings.get("api_key", ""), password=True,
+                              multiline=False, hint_text="Paste API key here",
+                              size_hint_y=None, height=dp(46))
+        panel.add_widget(key_input)
+        panel.add_widget(Label(text="Model: " + MODEL, color=MUTED,
+                               size_hint_y=None, height=dp(28)))
+        buttons = BoxLayout(size_hint_y=None, height=dp(44), spacing=dp(8))
+        save_button = Button(text="Save", background_normal="", background_color=PURPLE, color=BG)
+        close_button = Button(text="Close", background_normal="", background_color=PANEL, color=TEXT)
+        buttons.add_widget(save_button)
+        buttons.add_widget(close_button)
+        panel.add_widget(buttons)
+        popup = Popup(title="SHADOW AI Settings", content=panel, size_hint=(0.92, None),
+                      height=dp(255), separator_color=PURPLE)
 
-  @override
-  void dispose() {
-    _fadeController.dispose();
-    _searchController.dispose();
-    super.dispose();
-  }
+        def save_key(*_):
+            key = key_input.text.strip()
+            if not key:
+                self.status.text = "Please enter a valid API key."
+                return
+            self.settings["api_key"] = key
+            save_json(self.config_path, self.settings)
+            self.client = None
+            self.status.text = "API key saved locally."
+            popup.dismiss()
 
-  Future<void> _loadTasks() async {
-    try {
-      final prefs = await SharedPreferences.getInstance();
-      final data = prefs.getString(_storageKey);
-      if (data != null && data.isNotEmpty) {
-        final list = jsonDecode(data) as List<dynamic>;
-        _tasks.clear();
-        _tasks.addAll(list.map((e) => Task.fromJson(e as Map<String, dynamic>)));
-      }
-    } catch (_) {}
-    setState(() => _loading = false);
-    _fadeController.forward();
-  }
+        save_button.bind(on_release=save_key)
+        close_button.bind(on_release=lambda *_: popup.dismiss())
+        popup.open()
 
-  Future<void> _saveTasks() async {
-    try {
-      final prefs = await SharedPreferences.getInstance();
-      final data = jsonEncode(_tasks.map((t) => t.toJson()).toList());
-      await prefs.setString(_storageKey, data);
-    } catch (_) {}
-  }
+    def render_history(self):
+        self.chat.clear_widgets()
+        items = self.history[-100:] or [{
+            "role": "assistant",
+            "content": "Welcome to SHADOW AI. Ask me about coding or any topic you want to understand."
+        }]
+        for item in items:
+            self.add_bubble(item.get("role", "assistant"), item.get("content", ""))
+        Clock.schedule_once(lambda *_: setattr(self.scroll, "scroll_y", 0), 0.12)
 
-  void _addTask(String title) {
-    final trimmed = title.trim();
-    if (trimmed.isEmpty) return;
-    setState(() {
-      _tasks.insert(
-        0,
-        Task(
-          id: DateTime.now().microsecondsSinceEpoch.toString(),
-          title: trimmed,
-          createdAt: DateTime.now(),
-        ),
-      );
-    });
-    _saveTasks();
-    HapticFeedback.lightImpact();
-    _showSnack('تمت إضافة المهمة', success: true);
-  }
+    def add_bubble(self, role, content):
+        is_user = role == "user"
+        bubble = BoxLayout(orientation="vertical", size_hint_y=None, padding=dp(11), spacing=dp(5))
+        with bubble.canvas.before:
+            Color(*(USER_BG if is_user else PANEL))
+            shape = RoundedRectangle(pos=bubble.pos, size=bubble.size, radius=[dp(12)])
+        bubble.bind(pos=lambda widget, pos: setattr(shape, "pos", pos),
+                    size=lambda widget, size: setattr(shape, "size", size))
+        heading = Label(text="[b]You[/b]" if is_user else "[b]SHADOW AI[/b]",
+                        markup=True, color=TEXT if is_user else PURPLE,
+                        size_hint_y=None, height=dp(22), halign="left", valign="middle")
+        heading.bind(size=lambda widget, size: setattr(widget, "text_size", size))
+        body = Label(text=str(content), color=TEXT, size_hint_y=None, halign="left", valign="top")
+        body.bind(width=lambda widget, width: setattr(widget, "text_size", (max(width-dp(8), dp(50)), None)))
+        body.bind(texture_size=lambda widget, size: setattr(widget, "height", size[1] + dp(8)))
+        bubble.add_widget(heading)
+        bubble.add_widget(body)
+        bubble.height = dp(38) + body.height
+        self.chat.add_widget(bubble)
+        Clock.schedule_once(lambda *_: setattr(self.scroll, "scroll_y", 0), 0.12)
 
-  void _toggleTask(Task task) {
-    setState(() => task.done = !task.done);
-    _saveTasks();
-    HapticFeedback.selectionClick();
-  }
+    def persist_history(self):
+        save_json(self.history_path, self.history)
 
-  void _deleteTask(Task task) {
-    final index = _tasks.indexOf(task);
-    if (index == -1) return;
-    setState(() => _tasks.removeAt(index));
-    _saveTasks();
-    _showSnack(
-      'تم حذف المهمة',
-      actionLabel: 'تراجع',
-      onAction: () {
-        setState(() => _tasks.insert(index, task));
-        _saveTasks();
-      },
-    );
-  }
+    def new_chat(self):
+        self.history = []
+        self.persist_history()
+        self.render_history()
+        self.status.text = "Started a new chat."
 
-  void _clearCompleted() {
-    final completed = _tasks.where((t) => t.done).toList();
-    if (completed.isEmpty) {
-      _showSnack('لا توجد مهام مكتملة');
-      return;
-    }
-    showDialog(
-      context: context,
-      builder: (ctx) => _buildConfirmDialog(
-        ctx,
-        title: 'حذف المهام المكتملة',
-        message: 'سيتم حذف ${completed.length} مهمة مكتملة. لا يمكن التراجع.',
-        onConfirm: () {
-          setState(() => _tasks.removeWhere((t) => t.done));
-          _saveTasks();
-          Navigator.pop(ctx);
-          _showSnack('تم حذف ${completed.length} مهمة', success: true);
-        },
-      ),
-    );
-  }
+    def copy_last(self):
+        for item in reversed(self.history):
+            if item.get("role") == "assistant":
+                Clipboard.copy(item.get("content", ""))
+                self.status.text = "Last reply copied."
+                return
+        self.status.text = "There is no reply to copy yet."
 
-  void _showSnack(String message,
-      {String? actionLabel, VoidCallback? onAction, bool success = false}) {
-    if (!mounted) return;
-    ScaffoldMessenger.of(context).clearSnackBars();
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(
-        content: Row(
-          children: [
-            Icon(
-              success ? Icons.check_circle_rounded : Icons.info_outline_rounded,
-              color: success ? AppTheme.success : AppTheme.textPrimary,
-              size: 20,
-            ),
-            const SizedBox(width: 10),
-            Expanded(
-              child: Text(
-                message,
-                style: const TextStyle(color: AppTheme.textPrimary),
-              ),
-            ),
-          ],
-        ),
-        backgroundColor: AppTheme.surfaceAlt,
-        behavior: SnackBarBehavior.floating,
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-        margin: const EdgeInsets.all(16),
-        duration: const Duration(seconds: 3),
-        action: actionLabel != null
-            ? SnackBarAction(
-                label: actionLabel,
-                textColor: AppTheme.primaryLight,
-                onPressed: onAction ?? () {},
-              )
-            : null,
-      ),
-    );
-  }
+    def send_message(self):
+        prompt = self.message_input.text.strip()
+        if not prompt or self.busy:
+            return
+        if not self.settings.get("api_key"):
+            self.show_settings()
+            self.status.text = "Add your API key first."
+            return
+        if genai is None:
+            self.status.text = "google-genai is unavailable. Check the build instructions."
+            return
 
-  Widget _buildConfirmDialog(
-    BuildContext ctx, {
-    required String title,
-    required String message,
-    required VoidCallback onConfirm,
-  }) {
-    return AlertDialog(
-      backgroundColor: AppTheme.surface,
-      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(18)),
-      title: Text(title, style: const TextStyle(color: AppTheme.textPrimary)),
-      content: Text(message, style: const TextStyle(color: AppTheme.textMuted)),
-      actions: [
-        TextButton(
-          onPressed: () => Navigator.pop(ctx),
-          child: const Text('إلغاء',
-              style: TextStyle(color: AppTheme.textMuted)),
-        ),
-        TextButton(
-          onPressed: onConfirm,
-          child: const Text('تأكيد',
-              style: TextStyle(
-                  color: AppTheme.danger, fontWeight: FontWeight.bold)),
-        ),
-      ],
-    );
-  }
+        self.message_input.text = ""
+        self.history.append({"role": "user", "content": prompt, "time": datetime.now().isoformat()})
+        self.persist_history()
+        self.add_bubble("user", prompt)
+        self.busy = True
+        self.send_button.disabled = True
+        self.status.text = "SHADOW AI is thinking..."
+        threading.Thread(target=self.request_worker, daemon=True).start()
 
-  void _openAddDialog() {
-    final controller = TextEditingController();
-    showDialog(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        backgroundColor: AppTheme.surface,
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(18)),
-        title: Row(
-          children: const [
-            Icon(Icons.add_task_rounded, color: AppTheme.primaryLight),
-            SizedBox(width: 10),
-            Text('مهمة جديدة',
-                style: TextStyle(color: AppTheme.textPrimary)),
-          ],
-        ),
-        content: TextField(
-          controller: controller,
-          autofocus: true,
-          textInputAction: TextInputAction.done,
-          onSubmitted: (v) {
-            _addTask(v);
-            Navigator.pop(ctx);
-          },
-          decoration: const InputDecoration(
-            hintText: 'اكتب المهمة...',
-            prefixIcon: Icon(Icons.edit_rounded),
-          ),
-          style: const TextStyle(color: AppTheme.textPrimary),
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(ctx),
-            child: const Text('إلغاء',
-                style: TextStyle(color: AppTheme.textMuted)),
-          ),
-          FilledButton(
-            onPressed: () {
-              _addTask(controller.text);
-              Navigator.pop(ctx);
-            },
-            style: FilledButton.styleFrom(backgroundColor: AppTheme.primary),
-            child: const Text('إضافة'),
-          ),
-        ],
-      ),
-    );
-  }
-
-  List<Task> get _visibleTasks {
-    Iterable<Task> result = _tasks;
-    if (_filter == TaskFilter.active) {
-      result = result.where((t) => !t.done);
-    } else if (_filter == TaskFilter.completed) {
-      result = result.where((t) => t.done);
-    }
-    if (_searchQuery.isNotEmpty) {
-      final q = _searchQuery.toLowerCase();
-      result = result.where((t) => t.title.toLowerCase().contains(q));
-    }
-    return result.toList();
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    if (_loading) {
-      return const Scaffold(
-        body: Center(
-          child: CircularProgressIndicator(color: AppTheme.primaryLight),
-        ),
-      );
-    }
-
-    final visible = _visibleTasks;
-    final total = _tasks.length;
-    final completed = _tasks.where((t) => t.done).length;
-    final active = total - completed;
-    final progress = total == 0 ? 0.0 : completed / total;
-
-    return Scaffold(
-      appBar: AppBar(
-        title: const Text('Nyrvox Ai_1'),
-        actions: [
-          if (completed > 0)
-            IconButton(
-              tooltip: 'حذف المكتملة',
-              icon: const Icon(Icons.delete_sweep_rounded),
-              onPressed: _clearCompleted,
-            ),
-        ],
-      ),
-      floatingActionButton: FloatingActionButton.extended(
-        onPressed: _openAddDialog,
-        icon: const Icon(Icons.add_rounded),
-        label: const Text('مهمة جديدة',
-            style: TextStyle(fontWeight: FontWeight.bold)),
-      ),
-      body: Column(
-        children: [
-          _buildHeader(total, completed, active, progress),
-          _buildSearchBar(),
-          _buildFilters(total, active, completed),
-          Expanded(
-            child: visible.isEmpty
-                ? _buildEmptyState()
-                : _buildTaskList(visible),
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildHeader(int total, int completed, int active, double progress) {
-    return Padding(
-      padding: const EdgeInsets.fromLTRB(16, 8, 16, 12),
-      child: Container(
-        padding: const EdgeInsets.all(18),
-        decoration: BoxDecoration(
-          gradient: const LinearGradient(
-            colors: [Color(0xFF1F6FEB), Color(0xFF0D419D)],
-            begin: Alignment.topLeft,
-            end: Alignment.bottomRight,
-          ),
-          borderRadius: BorderRadius.circular(20),
-          boxShadow: [
-            BoxShadow(
-              color: AppTheme.primary.withOpacity(0.3),
-              blurRadius: 16,
-              offset: const Offset(0, 6),
-            ),
-          ],
-        ),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Row(
-              children: [
-                const Icon(Icons.task_alt_rounded,
-                    color: Colors.white, size: 28),
-                const SizedBox(width: 10),
-                Text(
-                  total == 0 ? 'لا توجد مهام بعد' : 'مهامك',
-                  style: const TextStyle(
-                    color: Colors.white,
-                    fontSize: 18,
-                    fontWeight: FontWeight.bold,
-                  ),
-                ),
-              ],
-            ),
-            const SizedBox(height: 14),
-            Row(
-              mainAxisAlignment: MainAxisAlignment.spaceBetween,
-              children: [
-                _statChip('الإجمالي', total, Colors.white),
-                _statChip('نشطة', active, AppTheme.warning),
-                _statChip('مكتملة', completed, AppTheme.success),
-              ],
-            ),
-            const SizedBox(height: 16),
-            ClipRRect(
-              borderRadius: BorderRadius.circular(8),
-              child: TweenAnimationBuilder<double>(
-                tween: Tween(begin: 0, end: progress),
-                duration: const Duration(milliseconds: 600),
-                builder: (_, value, __) => LinearProgressIndicator(
-                  value: value,
-                  minHeight: 8,
-                  backgroundColor: Colors.white24,
-                  valueColor:
-                      const AlwaysStoppedAnimation<Color>(Colors.white),
-                ),
-              ),
-            ),
-            const SizedBox(height: 6),
-            Text(
-              '${(progress * 100).toStringAsFixed(0)}% إنجاز',
-              style: const TextStyle(color: Colors.white70, fontSize: 12),
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-
-  Widget _statChip(String label, int value, Color color) {
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-      decoration: BoxDecoration(
-        color: Colors.white.withOpacity(0.15),
-        borderRadius: BorderRadius.circular(10),
-      ),
-      child: Column(
-        children: [
-          Text(
-            '$value',
-            style: TextStyle(
-              color: color,
-              fontSize: 18,
-              fontWeight: FontWeight.bold,
-            ),
-          ),
-          Text(
-            label,
-            style: const TextStyle(color: Colors.white70, fontSize: 11),
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildSearchBar() {
-    return Padding(
-      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-      child: TextField(
-        controller: _searchController,
-        onChanged: (v) => setState(() => _searchQuery = v),
-        style: const TextStyle(color: AppTheme.textPrimary),
-        decoration: InputDecoration(
-          hintText: 'بحث في المهام...',
-          prefixIcon: const Icon(Icons.search_rounded,
-              color: AppTheme.textMuted),
-          suffixIcon: _searchQuery.isNotEmpty
-              ? IconButton(
-                  icon: const Icon(Icons.clear_rounded,
-                      color: AppTheme.textMuted),
-                  onPressed: () {
-                    _searchController.clear();
-                    setState(() => _searchQuery = '');
-                  },
+    def request_worker(self):
+        try:
+            if self.client is None:
+                self.client = genai.Client(api_key=self.settings["api_key"])
+            contents = []
+            for item in self.history[-20:]:
+                role = item.get("role")
+                if role in ("user", "assistant"):
+                    contents.append({
+                        "role": "user" if role == "user" else "model",
+                        "parts": [{"text": item.get("content", "")}]
+                    })
+            response = self.client.models.generate_content(
+                model=MODEL,
+                contents=contents,
+                config=types.GenerateContentConfig(
+                    system_instruction=SYSTEM_PROMPT,
+                    temperature=0.7,
+                    max_output_tokens=2048
                 )
-              : null,
-        ),
-      ),
-    );
-  }
+            )
+            answer = (response.text or "").strip() or "No text response received. Please try again."
+            Clock.schedule_once(lambda *_: self.finish_request(answer, None), 0)
+        except Exception as exc:
+            error_name = type(exc).__name__
+            message = "Connection failed. Check your internet connection and API key."
+            if "429" in str(exc) or "ResourceExhausted" in error_name:
+                message = "Usage limit reached temporarily. Please try again later."
+            elif "401" in str(exc) or "403" in str(exc) or "PermissionDenied" in error_name:
+                message = "The API key is invalid or does not have access."
+            Clock.schedule_once(lambda *_: self.finish_request(None, message), 0)
 
-  Widget _buildFilters(int total, int active, int completed) {
-    return Padding(
-      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
-      child: Row(
-        children: [
-          _filterChip('الكل', TaskFilter.all, total),
-          const SizedBox(width: 8),
-          _filterChip('نشطة', TaskFilter.active, active),
-          const SizedBox(width: 8),
-          _filterChip('مكتملة', TaskFilter.completed, completed),
-        ],
-      ),
-    );
-  }
+    def finish_request(self, answer, error):
+        self.busy = False
+        self.send_button.disabled = False
+        if error:
+            self.status.text = error
+            self.add_bubble("assistant", error)
+            return
+        self.history.append({"role": "assistant", "content": answer, "time": datetime.now().isoformat()})
+        self.persist_history()
+        self.add_bubble("assistant", answer)
+        self.status.text = "Reply complete. Saved locally."
 
-  Widget _filterChip(String label, TaskFilter filter, int count) {
-    final selected = _filter == filter;
-    return Expanded(
-      child: GestureDetector(
-        onTap: () => setState(() => _filter = filter),
-        child: AnimatedContainer(
-          duration: const Duration(milliseconds: 200),
-          padding: const EdgeInsets.symmetric(vertical: 10),
-          decoration: BoxDecoration(
-            color: selected ? AppTheme.primary : AppTheme.surfaceAlt,
-            borderRadius: BorderRadius.circular(12),
-            border: Border.all(
-              color: selected ? AppTheme.primaryLight : AppTheme.border,
-            ),
-          ),
-          child: Column(
-            children: [
-              Text(
-                '$count',
-                style: TextStyle(
-                  color: selected ? Colors.white : AppTheme.textPrimary,
-                  fontSize: 16,
-                  fontWeight: FontWeight.bold,
-                ),
-              ),
-              Text(
-                label,
-                style: TextStyle(
-                  color: selected ? Colors.white70 : AppTheme.textMuted,
-                  fontSize: 11,
-                ),
-              ),
-            ],
-          ),
-        ),
-      ),
-    );
-  }
-
-  Widget _buildTaskList(List<Task> visible) {
-    return FadeTransition(
-      opacity: _fadeController,
-      child: ListView.builder(
-        padding: const EdgeInsets.fromLTRB(12, 8, 12, 100),
-        itemCount: visible.length,
-        itemBuilder: (context, index) {
-          final task = visible[index];
-          return _buildTaskItem(task);
-        },
-      ),
-    );
-  }
-
-  Widget _buildTaskItem(Task task) {
-    return Dismissible(
-      key: ValueKey(task.id),
-      direction: DismissDirection.endToStart,
-      background: Container(
-        margin: const EdgeInsets.symmetric(vertical: 4),
-        padding: const EdgeInsets.symmetric(horizontal: 20),
-        decoration: BoxDecoration(
-          color: AppTheme.danger,
-          borderRadius: BorderRadius.circular(14),
-        ),
-        alignment: Alignment.centerRight,
-        child: const Icon(Icons.delete_rounded,
-            color: Colors.white, size: 26),
-      ),
-      confirmDismiss: (_) async {
-        _deleteTask(task);
-        return false;
-      },
-      child: AnimatedContainer(
-        duration: const Duration(milliseconds: 250),
-        margin: const EdgeInsets.symmetric(vertical: 4),
-        decoration: BoxDecoration(
-          color: AppTheme.surface,
-          borderRadius: BorderRadius.circular(14),
-          border: Border.all(
-            color: task.done
-                ? AppTheme.success.withOpacity(0.4)
-                : AppTheme.border,
-          ),
-        ),
-        child: Material(
-          color: Colors.transparent,
-          child: InkWell(
-            borderRadius: BorderRadius.circular(14),
-            onTap: () => _toggleTask(task),
-            child: Padding(
-              padding: const EdgeInsets.all(14),
-              child: Row(
-                children: [
-                  AnimatedContainer(
-                    duration: const Duration(milliseconds: 250),
-                    width: 26,
-                    height: 26,
-                    decoration: BoxDecoration(
-                      color: task.done
-                          ? AppTheme.success
-                          : Colors.transparent,
-                      borderRadius: BorderRadius.circular(8),
-                      border: Border.all(
-                        color: task.done
-                            ? AppTheme.success
-                            : AppTheme.textMuted,
-                        width: 2,
-                      ),
-                    ),
-                    child: task.done
-                        ? const Icon(Icons.check_rounded,
-                            color: Colors.white, size: 18)
-                        : null,
-                  ),
-                  const SizedBox(width: 14),
-                  Expanded(
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Text(
-                          task.title,
-                          style: TextStyle(
-                            color: task.done
-                                ? AppTheme.textMuted
-                                : AppTheme.textPrimary,
-                            fontSize: 15,
-                            decoration: task.done
-                                ? TextDecoration.lineThrough
-                                : null,
-                            decorationColor: AppTheme.textMuted,
-                          ),
-                        ),
-                        const SizedBox(height: 4),
-                        Text(
-                          _formatDate(task.createdAt),
-                          style: const TextStyle(
-                            color: AppTheme.textMuted,
-                            fontSize: 11,
-                          ),
-                        ),
-                      ],
-                    ),
-                  ),
-                  IconButton(
-                    tooltip: 'حذف',
-                    icon: const Icon(Icons.delete_outline_rounded,
-                        color: AppTheme.textMuted),
-                    onPressed: () => _deleteTask(task),
-                  ),
-                ],
-              ),
-            ),
-          ),
-        ),
-      ),
-    );
-  }
-
-  String _formatDate(DateTime date) {
-    final now = DateTime.now();
-    final diff = now.difference(date);
-    if (diff.inMinutes < 1) return 'الآن';
-    if (diff.inHours < 1) return 'منذ ${diff.inMinutes} دقيقة';
-    if (diff.inDays < 1) return 'منذ ${diff.inHours} ساعة';
-    if (diff.inDays == 1) return 'أمس';
-    return 'منذ ${diff.inDays} يوم';
-  }
-
-  Widget _buildEmptyState() {
-    final String message;
-    final IconData icon;
-    if (_searchQuery.isNotEmpty) {
-      message = 'لا توجد نتائج للبحث';
-      icon = Icons.search_off_rounded;
-    } else if (_filter == TaskFilter.completed) {
-      message = 'لا توجد مهام مكتملة بعد';
-      icon = Icons.check_circle_outline_rounded;
-    } else if (_filter == TaskFilter.active) {
-      message = 'كل المهام مكتملة!';
-      icon = Icons.celebration_rounded;
-    } else {
-      message = 'ابدأ بإضافة مهمتك الأولى';
-      icon = Icons.playlist_add_rounded;
-    }
-
-    return Center(
-      child: Column(
-        mainAxisAlignment: MainAxisAlignment.center,
-        children: [
-          Container(
-            padding: const EdgeInsets.all(24),
-            decoration: BoxDecoration(
-              color: AppTheme.surfaceAlt,
-              shape: BoxShape.circle,
-              border: Border.all(color: AppTheme.border),
-            ),
-            child: Icon(icon, size: 56, color: AppTheme.primaryLight),
-          ),
-          const SizedBox(height: 20),
-          Text(
-            message,
-            style: const TextStyle(
-              color: AppTheme.textMuted,
-              fontSize: 15,
-            ),
-          ),
-          const SizedBox(height: 6),
-          const Text(
-            'استخدم الزر أدناه للبدء',
-            style: TextStyle(color: AppTheme.textMuted, fontSize: 12),
-          ),
-        ],
-      ),
-    );
-  }
-}
+if __name__ == "__main__":
+    ShadowAI().run()
